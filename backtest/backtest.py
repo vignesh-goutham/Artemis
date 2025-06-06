@@ -23,6 +23,7 @@ class Trade:
         self.profit_loss = None
         self.profit_loss_percentage = None
         self.dip_buys = []  # List to track dip buy points
+        self.momentum_buys = []  # List to track momentum buy points
 
     def execute(self, initial_balance: float) -> None:
         # Get historical data
@@ -39,6 +40,13 @@ class Trade:
         
         # Calculate technical indicators
         hist['SMA20'] = hist['Close'].rolling(window=20).mean()
+        hist['SMA50'] = hist['Close'].rolling(window=50).mean()
+        hist['RSI'] = self.calculate_rsi(hist['Close'])
+        
+        # Calculate momentum indicators
+        hist['Price_Change'] = hist['Close'].pct_change()
+        hist['Volume_Change'] = hist['Volume'].pct_change()
+        hist['Momentum'] = hist['Close'] - hist['Close'].shift(5)  # 5-day momentum
         
         # Set buy price as the first available closing price on or after the buy date
         buy_price_row = hist[hist.index >= self.buy_date]
@@ -48,12 +56,13 @@ class Trade:
         self.investment_amount = initial_balance * (self.allocation_percentage / 100)
         self.initial_shares = self.investment_amount / self.buy_price
         
-        # Initialize variables for dip buying
+        # Initialize variables for dip buying and momentum buying
         lowest_price = self.buy_price
         highest_price = self.buy_price
         current_shares = self.initial_shares
         current_investment = self.investment_amount
         last_dip_buy_date = None
+        last_momentum_buy_date = None
         
         # Check each day's price action
         for i in range(1, len(hist)):
@@ -100,9 +109,48 @@ class Trade:
                     'date': current_date,
                     'price': current_price,
                     'shares': additional_shares,
-                    'investment': additional_investment
+                    'investment': additional_investment,
+                    'type': 'dip'
                 })
                 last_dip_buy_date = current_date
+            
+            # Conditions for momentum buying:
+            # 1. Price is above both 20-day and 50-day SMAs (strong uptrend)
+            # 2. RSI is between 50-70 (not overbought)
+            # 3. 5-day momentum is positive
+            # 4. Volume is increasing (at least 20% higher than previous day)
+            # 5. Price is at least 5% above initial buy price
+            # 6. We haven't already made 2 momentum buys
+            # 7. At least 5 trading days since last momentum buy
+            elif (i >= 50 and
+                  current_price > hist['SMA20'].iloc[i] and
+                  current_price > hist['SMA50'].iloc[i] and
+                  50 <= hist['RSI'].iloc[i] <= 70 and
+                  hist['Momentum'].iloc[i] > 0 and
+                  hist['Volume_Change'].iloc[i] > 0.20 and
+                  price_change_from_buy >= 0.05 and
+                  len(self.momentum_buys) < 2 and
+                  (last_momentum_buy_date is None or (current_date - last_momentum_buy_date).days >= 5)):
+                
+                # Calculate additional investment (same as initial)
+                additional_investment = self.investment_amount
+                additional_shares = additional_investment / current_price
+                
+                # Update position
+                self.additional_shares += additional_shares
+                self.additional_investment += additional_investment
+                current_shares += additional_shares
+                current_investment += additional_investment
+                
+                # Record momentum buy
+                self.momentum_buys.append({
+                    'date': current_date,
+                    'price': current_price,
+                    'shares': additional_shares,
+                    'investment': additional_investment,
+                    'type': 'momentum'
+                })
+                last_momentum_buy_date = current_date
         
         # Calculate final position
         self.total_shares = self.initial_shares + self.additional_shares
@@ -111,10 +159,10 @@ class Trade:
         # Final sell at end date
         self.sell_price = hist['Close'].iloc[-1]
         self.profit_loss = (self.sell_price - self.buy_price) * self.initial_shares
-        if self.additional_shares > 0:
-            # Add profit/loss from additional shares
-            for dip_buy in self.dip_buys:
-                self.profit_loss += (self.sell_price - dip_buy['price']) * dip_buy['shares']
+        
+        # Add profit/loss from additional shares (both dip and momentum buys)
+        for additional_buy in self.dip_buys + self.momentum_buys:
+            self.profit_loss += (self.sell_price - additional_buy['price']) * additional_buy['shares']
         
         # Calculate overall profit percentage
         self.profit_loss_percentage = (self.profit_loss / self.total_investment) * 100
@@ -182,7 +230,8 @@ class Backtester:
                         'total_investment': round(trade.total_investment, 2),
                         'profit_loss': round(trade.profit_loss, 2),
                         'profit_loss_percentage': round(trade.profit_loss_percentage, 2),
-                        'dip_buys': len(trade.dip_buys)
+                        'dip_buys': len(trade.dip_buys),
+                        'momentum_buys': len(trade.momentum_buys)
                     }
                     self.results.append(result)
             except Exception as e:
@@ -205,7 +254,8 @@ class Backtester:
                     'Investment': f"${result['initial_investment']:,.2f}",
                     'Profit/Loss': f"${(result['sell_price'] - result['buy_price']) * result['initial_shares']:,.2f}",
                     'Profit/Loss %': f"{((result['sell_price'] - result['buy_price']) / result['buy_price'] * 100):,.2f}%",
-                    'Dip Buy': 'No'
+                    'Dip Buy': 'No',
+                    'Momentum Buy': 'No'
                 }
                 all_trades.append(initial_trade)
                 
@@ -222,9 +272,28 @@ class Backtester:
                             'Investment': f"${dip_buy['investment']:,.2f}",
                             'Profit/Loss': f"${(result['sell_price'] - dip_buy['price']) * dip_buy['shares']:,.2f}",
                             'Profit/Loss %': f"{((result['sell_price'] - dip_buy['price']) / dip_buy['price'] * 100):,.2f}%",
-                            'Dip Buy': 'Yes'
+                            'Dip Buy': 'Yes',
+                            'Momentum Buy': 'No'
                         }
                         all_trades.append(dip_trade)
+                
+                # Add momentum buys if any
+                if result['momentum_buys'] > 0:
+                    for momentum_buy in self.trades[self.results.index(result)].momentum_buys:
+                        momentum_trade = {
+                            'Ticker': result['ticker'],
+                            'Buy Date': momentum_buy['date'].strftime('%Y-%m-%d'),
+                            'Sell Date': result['sell_date'],
+                            'Buy Price': f"${momentum_buy['price']:,.2f}",
+                            'Sell Price': f"${result['sell_price']:,.2f}",
+                            'Shares': f"{momentum_buy['shares']:,.4f}",
+                            'Investment': f"${momentum_buy['investment']:,.2f}",
+                            'Profit/Loss': f"${(result['sell_price'] - momentum_buy['price']) * momentum_buy['shares']:,.2f}",
+                            'Profit/Loss %': f"{((result['sell_price'] - momentum_buy['price']) / momentum_buy['price'] * 100):,.2f}%",
+                            'Dip Buy': 'No',
+                            'Momentum Buy': 'Yes'
+                        }
+                        all_trades.append(momentum_trade)
             
             # Create DataFrame from all trades
             trades_df = pd.DataFrame(all_trades)
@@ -264,6 +333,10 @@ class Backtester:
         total_dip_buys = trades_df['dip_buys'].sum()
         avg_dip_buys = trades_df['dip_buys'].mean()
         
+        # Calculate momentum buying statistics
+        total_momentum_buys = trades_df['momentum_buys'].sum()
+        avg_momentum_buys = trades_df['momentum_buys'].mean()
+        
         # Print summary
         print("\n=== Backtesting Summary ===")
         print(f"Initial Balance: ${self.initial_balance:,.2f}")
@@ -281,6 +354,8 @@ class Backtester:
         print(f"Average Profit/Loss % per Trade: {avg_profit_loss_pct:,.2f}%")
         print(f"Total Dip Buys: {total_dip_buys}")
         print(f"Average Dip Buys per Trade: {avg_dip_buys:.1f}")
+        print(f"Total Momentum Buys: {total_momentum_buys}")
+        print(f"Average Momentum Buys per Trade: {avg_momentum_buys:.1f}")
         
         print("\n=== Time Period Analysis ===")
         print(f"Earliest Buy Date: {earliest_buy.strftime('%Y-%m-%d')}")
