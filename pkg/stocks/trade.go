@@ -63,7 +63,7 @@ func processTrade(trade types.Trade, historicalData map[string]alpaca.StockData,
 			trade.Ticker, updatedTrade.TotalShares, updatedTrade.BuyPrice)
 		trade = updatedTrade
 	} else if trade.Status == "ACTIVE" {
-		if len(trade.DipBuys) < 2 && checkDipBuyConditions(hist, trade.BuyPrice, &trade.LastDipBuyDate, currentPrice) {
+		if len(trade.DipBuys) < 2 && CheckDipBuyConditions(hist, trade.BuyPrice, &trade.LastDipBuyDate, currentPrice) {
 			log.Printf("Dip buy conditions met for %s: CurrentPrice=$%s, BuyPrice=$%s, DipBuys=%d",
 				trade.Ticker, currentPrice, trade.BuyPrice, len(trade.DipBuys))
 			updatedTrade, _, err := executeDipBuy(trade, currentPrice)
@@ -152,8 +152,8 @@ func executeDipBuy(trade types.Trade, currentPrice decimal.Decimal) (types.Trade
 	return trade, true, nil
 }
 
-// checkDipBuyConditions checks if conditions are met for a dip buy
-func checkDipBuyConditions(hist alpaca.StockData, buyPrice decimal.Decimal, lastDipBuyDate *time.Time, currentPrice decimal.Decimal) bool {
+// CheckDipBuyConditions checks if conditions are met for a dip buy
+func CheckDipBuyConditions(hist alpaca.StockData, buyPrice decimal.Decimal, lastDipBuyDate *time.Time, currentPrice decimal.Decimal) bool {
 	if len(hist.Dates) == 0 {
 		return false
 	}
