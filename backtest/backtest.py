@@ -24,6 +24,8 @@ class Trade:
         self.profit_loss_percentage = None
         self.dip_buys = []  # List to track dip buy points
         self.momentum_buys = []  # List to track momentum buy points
+        self.partial_sells = []  # List to track partial sells
+        self.current_shares = 0  # Track current position size
 
     def execute(self, initial_balance: float) -> None:
         # Get historical data
@@ -48,6 +50,10 @@ class Trade:
         hist['Volume_Change'] = hist['Volume'].pct_change()
         hist['Momentum'] = hist['Close'] - hist['Close'].shift(5)  # 5-day momentum
         
+        # Calculate volatility indicators
+        hist['ATR'] = self.calculate_atr(hist, period=14)
+        hist['Volatility'] = hist['ATR'] / hist['Close'] * 100  # Volatility as percentage
+        
         # Set buy price as the first available closing price on or after the buy date
         buy_price_row = hist[hist.index >= self.buy_date]
         if buy_price_row.empty:
@@ -55,14 +61,15 @@ class Trade:
         self.buy_price = buy_price_row['Close'].iloc[0]
         self.investment_amount = initial_balance * (self.allocation_percentage / 100)
         self.initial_shares = self.investment_amount / self.buy_price
+        self.current_shares = self.initial_shares
         
         # Initialize variables for dip buying and momentum buying
         lowest_price = self.buy_price
         highest_price = self.buy_price
-        current_shares = self.initial_shares
         current_investment = self.investment_amount
         last_dip_buy_date = None
         last_momentum_buy_date = None
+        last_partial_sell_date = None
         
         # Check each day's price action
         for i in range(1, len(hist)):
@@ -78,6 +85,38 @@ class Trade:
             # Calculate price changes
             price_change_from_high = (highest_price - current_price) / highest_price
             price_change_from_buy = (current_price - self.buy_price) / self.buy_price
+            
+            # Check for partial selling opportunities
+            if self.current_shares > 0 and (last_partial_sell_date is None or (current_date - last_partial_sell_date).days >= 5):
+                # 1. Take profit on significant gains (30% or more)
+                if price_change_from_buy >= 0.30:
+                    sell_percentage = 0.50  # Sell 50% of position
+                    self._execute_partial_sell(current_date, current_price, sell_percentage, "take_profit")
+                    last_partial_sell_date = current_date
+                
+                # 2. Cut losses on significant downtrend
+                elif (current_price < hist['SMA20'].iloc[i] and 
+                      current_price < hist['SMA50'].iloc[i] and 
+                      hist['RSI'].iloc[i] < 30 and 
+                      price_change_from_buy <= -0.15):  # 15% loss
+                    sell_percentage = 0.75  # Sell 75% of position
+                    self._execute_partial_sell(current_date, current_price, sell_percentage, "cut_loss")
+                    last_partial_sell_date = current_date
+                
+                # 3. Reduce position on overbought conditions
+                elif (hist['RSI'].iloc[i] > 80 and 
+                      current_price > hist['SMA20'].iloc[i] * 1.1 and  # 10% above SMA20
+                      hist['Volume_Change'].iloc[i] < -0.20):  # Declining volume
+                    sell_percentage = 0.25  # Sell 25% of position
+                    self._execute_partial_sell(current_date, current_price, sell_percentage, "overbought")
+                    last_partial_sell_date = current_date
+                
+                # 4. Reduce position on high volatility
+                elif (hist['Volatility'].iloc[i] > 5.0 and  # 5% daily volatility
+                      price_change_from_buy > 0.20):  # In profit
+                    sell_percentage = 0.33  # Sell 33% of position
+                    self._execute_partial_sell(current_date, current_price, sell_percentage, "volatility")
+                    last_partial_sell_date = current_date
             
             # Conditions for dip buying:
             # 1. Price is below 20-day SMA (downtrend)
@@ -101,7 +140,7 @@ class Trade:
                 # Update position
                 self.additional_shares += additional_shares
                 self.additional_investment += additional_investment
-                current_shares += additional_shares
+                self.current_shares += additional_shares
                 current_investment += additional_investment
                 
                 # Record dip buy
@@ -139,7 +178,7 @@ class Trade:
                 # Update position
                 self.additional_shares += additional_shares
                 self.additional_investment += additional_investment
-                current_shares += additional_shares
+                self.current_shares += additional_shares
                 current_investment += additional_investment
                 
                 # Record momentum buy
@@ -153,19 +192,97 @@ class Trade:
                 last_momentum_buy_date = current_date
         
         # Calculate final position
-        self.total_shares = self.initial_shares + self.additional_shares
+        self.total_shares = self.current_shares  # Use current_shares instead of initial + additional
         self.total_investment = self.investment_amount + self.additional_investment
         
         # Final sell at end date
         self.sell_price = hist['Close'].iloc[-1]
-        self.profit_loss = (self.sell_price - self.buy_price) * self.initial_shares
         
-        # Add profit/loss from additional shares (both dip and momentum buys)
-        for additional_buy in self.dip_buys + self.momentum_buys:
-            self.profit_loss += (self.sell_price - additional_buy['price']) * additional_buy['shares']
+        # Calculate profit/loss including partial sells
+        self.profit_loss = 0
+        
+        # Add profit/loss from initial position
+        if self.initial_shares > 0:
+            self.profit_loss += (self.sell_price - self.buy_price) * self.initial_shares
+        
+        # Add profit/loss from dip buys
+        for dip_buy in self.dip_buys:
+            self.profit_loss += (self.sell_price - dip_buy['price']) * dip_buy['shares']
+        
+        # Add profit/loss from momentum buys
+        for momentum_buy in self.momentum_buys:
+            self.profit_loss += (self.sell_price - momentum_buy['price']) * momentum_buy['shares']
+        
+        # Add profit/loss from partial sells
+        for partial_sell in self.partial_sells:
+            self.profit_loss += (partial_sell['price'] - partial_sell['basis_price']) * partial_sell['shares']
         
         # Calculate overall profit percentage
         self.profit_loss_percentage = (self.profit_loss / self.total_investment) * 100
+
+    def _execute_partial_sell(self, date, price, percentage, reason):
+        """Execute a partial sell of the current position."""
+        shares_to_sell = self.current_shares * percentage
+        if shares_to_sell > 0:
+            # Calculate average basis price for the shares being sold
+            basis_price = self._calculate_basis_price(shares_to_sell)
+            
+            self.partial_sells.append({
+                'date': date,
+                'price': price,
+                'shares': shares_to_sell,
+                'basis_price': basis_price,
+                'reason': reason,
+                'profit_at_sell': (price - basis_price) * shares_to_sell,
+                'profit_pct_at_sell': ((price - basis_price) / basis_price) * 100
+            })
+            
+            # Update current position
+            self.current_shares -= shares_to_sell
+
+    def _calculate_basis_price(self, shares_to_sell):
+        """Calculate the average basis price for the shares being sold."""
+        total_cost = 0
+        remaining_shares = shares_to_sell
+        
+        # First use initial position
+        if self.initial_shares > 0:
+            shares_from_initial = min(remaining_shares, self.initial_shares)
+            total_cost += shares_from_initial * self.buy_price
+            remaining_shares -= shares_from_initial
+        
+        # Then use dip buys
+        for dip_buy in self.dip_buys:
+            if remaining_shares <= 0:
+                break
+            shares_from_dip = min(remaining_shares, dip_buy['shares'])
+            total_cost += shares_from_dip * dip_buy['price']
+            remaining_shares -= shares_from_dip
+        
+        # Finally use momentum buys
+        for momentum_buy in self.momentum_buys:
+            if remaining_shares <= 0:
+                break
+            shares_from_momentum = min(remaining_shares, momentum_buy['shares'])
+            total_cost += shares_from_momentum * momentum_buy['price']
+            remaining_shares -= shares_from_momentum
+        
+        return total_cost / shares_to_sell if shares_to_sell > 0 else 0
+
+    def calculate_atr(self, hist, period=14):
+        """Calculate Average True Range (ATR)."""
+        high = hist['High']
+        low = hist['Low']
+        close = hist['Close']
+        
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        
+        return atr
 
     def calculate_rsi(self, prices, period=14):
         # Calculate price changes
@@ -231,7 +348,8 @@ class Backtester:
                         'profit_loss': round(trade.profit_loss, 2),
                         'profit_loss_percentage': round(trade.profit_loss_percentage, 2),
                         'dip_buys': len(trade.dip_buys),
-                        'momentum_buys': len(trade.momentum_buys)
+                        'momentum_buys': len(trade.momentum_buys),
+                        'partial_sells': len(trade.partial_sells) if hasattr(trade, 'partial_sells') else 0
                     }
                     self.results.append(result)
             except Exception as e:
@@ -239,10 +357,12 @@ class Backtester:
 
     def print_results(self, detailed: bool = False) -> None:
         if detailed:
-            # Create a list to store all trade rows (including dip buys)
+            # Create a list to store all trade rows (including dip buys and partial sells)
             all_trades = []
             
             for result in self.results:
+                trade = self.trades[self.results.index(result)]
+                
                 # Add initial trade
                 initial_trade = {
                     'Ticker': result['ticker'],
@@ -255,13 +375,14 @@ class Backtester:
                     'Profit/Loss': f"${(result['sell_price'] - result['buy_price']) * result['initial_shares']:,.2f}",
                     'Profit/Loss %': f"{((result['sell_price'] - result['buy_price']) / result['buy_price'] * 100):,.2f}%",
                     'Dip Buy': 'No',
-                    'Momentum Buy': 'No'
+                    'Momentum Buy': 'No',
+                    'Partial Sell': 'No'
                 }
                 all_trades.append(initial_trade)
                 
                 # Add dip buys if any
                 if result['dip_buys'] > 0:
-                    for dip_buy in self.trades[self.results.index(result)].dip_buys:
+                    for dip_buy in trade.dip_buys:
                         dip_trade = {
                             'Ticker': result['ticker'],
                             'Buy Date': dip_buy['date'].strftime('%Y-%m-%d'),
@@ -273,13 +394,14 @@ class Backtester:
                             'Profit/Loss': f"${(result['sell_price'] - dip_buy['price']) * dip_buy['shares']:,.2f}",
                             'Profit/Loss %': f"{((result['sell_price'] - dip_buy['price']) / dip_buy['price'] * 100):,.2f}%",
                             'Dip Buy': 'Yes',
-                            'Momentum Buy': 'No'
+                            'Momentum Buy': 'No',
+                            'Partial Sell': 'No'
                         }
                         all_trades.append(dip_trade)
                 
                 # Add momentum buys if any
                 if result['momentum_buys'] > 0:
-                    for momentum_buy in self.trades[self.results.index(result)].momentum_buys:
+                    for momentum_buy in trade.momentum_buys:
                         momentum_trade = {
                             'Ticker': result['ticker'],
                             'Buy Date': momentum_buy['date'].strftime('%Y-%m-%d'),
@@ -291,9 +413,46 @@ class Backtester:
                             'Profit/Loss': f"${(result['sell_price'] - momentum_buy['price']) * momentum_buy['shares']:,.2f}",
                             'Profit/Loss %': f"{((result['sell_price'] - momentum_buy['price']) / momentum_buy['price'] * 100):,.2f}%",
                             'Dip Buy': 'No',
-                            'Momentum Buy': 'Yes'
+                            'Momentum Buy': 'Yes',
+                            'Partial Sell': 'No'
                         }
                         all_trades.append(momentum_trade)
+                
+                # Add partial sells if any
+                if hasattr(trade, 'partial_sells') and trade.partial_sells:
+                    for partial_sell in trade.partial_sells:
+                        # Calculate what would have happened if held until end date
+                        # For the shares that were sold, what would they be worth at end date
+                        end_date_value = (result['sell_price'] - partial_sell['basis_price']) * partial_sell['shares']
+                        end_date_pct = ((result['sell_price'] - partial_sell['basis_price']) / partial_sell['basis_price']) * 100
+                        
+                        # Calculate the difference between actual sell and end date
+                        value_difference = partial_sell['profit_at_sell'] - end_date_value
+                        pct_difference = partial_sell['profit_pct_at_sell'] - end_date_pct
+                        
+                        # Calculate the actual profit from selling early
+                        actual_profit = partial_sell['profit_at_sell']
+                        actual_pct = partial_sell['profit_pct_at_sell']
+                        
+                        partial_sell_trade = {
+                            'Ticker': result['ticker'],
+                            'Buy Date': 'N/A',
+                            'Sell Date': partial_sell['date'].strftime('%Y-%m-%d'),
+                            'Buy Price': f"${partial_sell['basis_price']:,.2f}",
+                            'Sell Price': f"${partial_sell['price']:,.2f}",
+                            'Shares': f"{partial_sell['shares']:,.4f}",
+                            'Investment': f"${partial_sell['shares'] * partial_sell['basis_price']:,.2f}",
+                            'Actual Profit': f"${actual_profit:,.2f}",
+                            'Actual Return %': f"{actual_pct:,.2f}%",
+                            'End Date Value': f"${end_date_value:,.2f}",
+                            'End Date Return %': f"{end_date_pct:,.2f}%",
+                            'Value Difference': f"${value_difference:,.2f}",
+                            'Return Difference %': f"{pct_difference:,.2f}%",
+                            'Dip Buy': 'No',
+                            'Momentum Buy': 'No',
+                            'Partial Sell': f"Yes ({partial_sell['reason']})"
+                        }
+                        all_trades.append(partial_sell_trade)
             
             # Create DataFrame from all trades
             trades_df = pd.DataFrame(all_trades)
@@ -301,6 +460,73 @@ class Backtester:
             # Print individual trade results
             print("\n=== Individual Trade Results ===")
             print(trades_df.to_string(index=False))
+            
+            # Calculate and print partial sell summary
+            partial_sells = trades_df[trades_df['Partial Sell'].str.contains('Yes', na=False)]
+            
+            if not partial_sells.empty:
+                print("\n=== Partial Sell Analysis ===")
+                
+                # Calculate totals
+                total_actual_profit = sum(float(x.strip('$').replace(',', '')) for x in partial_sells['Actual Profit'])
+                total_end_date_value = sum(float(x.strip('$').replace(',', '')) for x in partial_sells['End Date Value'])
+                total_investment = sum(float(x.strip('$').replace(',', '')) for x in partial_sells['Investment'])
+                
+                # Calculate return percentages
+                actual_return_pct = (total_actual_profit / total_investment) * 100 if total_investment > 0 else 0
+                end_date_return_pct = (total_end_date_value / total_investment) * 100 if total_investment > 0 else 0
+                return_difference_pct = actual_return_pct - end_date_return_pct
+                
+                print("Overall Performance:")
+                print(f"1. Total Investment in Partial Sells: ${total_investment:,.2f}")
+                print(f"2. Total Profit from Partial Sells: ${total_actual_profit:,.2f}")
+                print(f"3. Total Value if Held Until End Date: ${total_end_date_value:,.2f}")
+                print(f"\nReturn Analysis:")
+                print(f"1. Actual Return: {actual_return_pct:,.2f}%")
+                print(f"2. End Date Return: {end_date_return_pct:,.2f}%")
+                if return_difference_pct > 0:
+                    print(f"3. Additional Return from Selling Early: {return_difference_pct:,.2f}%")
+                else:
+                    print(f"3. Return Lost by Selling Early: {abs(return_difference_pct):,.2f}%")
+                
+                # Break down by reason
+                print("\nBreakdown by Sell Reason:")
+                for reason in ['take_profit', 'cut_loss', 'overbought', 'volatility']:
+                    reason_sells = partial_sells[partial_sells['Partial Sell'].str.contains(reason, na=False)]
+                    if not reason_sells.empty:
+                        reason_profit = sum(float(x.strip('$').replace(',', '')) for x in reason_sells['Actual Profit'])
+                        reason_end_value = sum(float(x.strip('$').replace(',', '')) for x in reason_sells['End Date Value'])
+                        reason_investment = sum(float(x.strip('$').replace(',', '')) for x in reason_sells['Investment'])
+                        
+                        # Calculate return percentages for this reason
+                        reason_return_pct = (reason_profit / reason_investment) * 100 if reason_investment > 0 else 0
+                        reason_end_return_pct = (reason_end_value / reason_investment) * 100 if reason_investment > 0 else 0
+                        reason_return_diff_pct = reason_return_pct - reason_end_return_pct
+                        
+                        print(f"\n{reason.replace('_', ' ').title()}:")
+                        print(f"  Number of Sells: {len(reason_sells)}")
+                        print(f"  Total Investment: ${reason_investment:,.2f}")
+                        print(f"  Total Profit from Sells: ${reason_profit:,.2f}")
+                        print(f"  Value if Held Until End: ${reason_end_value:,.2f}")
+                        print(f"\n  Return Analysis:")
+                        print(f"  - Actual Return: {reason_return_pct:,.2f}%")
+                        print(f"  - End Date Return: {reason_end_return_pct:,.2f}%")
+                        if reason_return_diff_pct > 0:
+                            print(f"  - Additional Return from Selling Early: {reason_return_diff_pct:,.2f}%")
+                        else:
+                            print(f"  - Return Lost by Selling Early: {abs(reason_return_diff_pct):,.2f}%")
+                        
+                        # Calculate average metrics
+                        avg_profit = reason_profit / len(reason_sells)
+                        avg_end_value = reason_end_value / len(reason_sells)
+                        avg_investment = reason_investment / len(reason_sells)
+                        
+                        print(f"\n  Average Metrics per Sell:")
+                        print(f"  - Average Investment: ${avg_investment:,.2f}")
+                        print(f"  - Average Profit: ${avg_profit:,.2f}")
+                        print(f"  - Average End Value: ${avg_end_value:,.2f}")
+                        print(f"  - Average Return: {(avg_profit / avg_investment * 100):,.2f}%")
+                        print(f"  - Average End Return: {(avg_end_value / avg_investment * 100):,.2f}%")
         
         # Calculate time-based metrics
         trades_df = pd.DataFrame(self.results)
@@ -337,6 +563,10 @@ class Backtester:
         total_momentum_buys = trades_df['momentum_buys'].sum()
         avg_momentum_buys = trades_df['momentum_buys'].mean()
         
+        # Calculate partial sell statistics
+        total_partial_sells = sum(len(trade.partial_sells) for trade in self.trades)
+        avg_partial_sells = total_partial_sells / len(self.trades) if self.trades else 0
+        
         # Print summary
         print("\n=== Backtesting Summary ===")
         print(f"Initial Balance: ${self.initial_balance:,.2f}")
@@ -356,6 +586,8 @@ class Backtester:
         print(f"Average Dip Buys per Trade: {avg_dip_buys:.1f}")
         print(f"Total Momentum Buys: {total_momentum_buys}")
         print(f"Average Momentum Buys per Trade: {avg_momentum_buys:.1f}")
+        print(f"Total Partial Sells: {total_partial_sells}")
+        print(f"Average Partial Sells per Trade: {avg_partial_sells:.1f}")
         
         print("\n=== Time Period Analysis ===")
         print(f"Earliest Buy Date: {earliest_buy.strftime('%Y-%m-%d')}")
