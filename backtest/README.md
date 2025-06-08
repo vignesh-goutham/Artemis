@@ -44,14 +44,9 @@ MSFT,2024-12-31,50,2024-01-01
 
 ### Running the Backtester
 
-You can run the backtester in two ways:
+You can run the backtester like below
 
-1. Using Make:
-```bash
-make run ARGS="--input trades.csv --initial_balance 10000 --detailed"
-```
-
-2. Running the script directly:
+1. Running the script directly:
 ```bash
 ./run_backtest.sh --input trades.csv --initial_balance 10000 --detailed
 ```
@@ -80,32 +75,3 @@ The backtester provides detailed performance metrics including:
 - Individual trade results (with `--detailed` flag)
 - Dip-buying statistics
 
-## Example Output
-
-```
-=== Backtesting Summary ===
-Initial Balance: $10,000.00
-Final Balance: $12,500.00
-Total Return: $2,500.00
-Total Return Percentage: 25.00%
-
-=== Trade Statistics ===
-Total Trades: 10
-Unique Symbols: 5
-Winning Trades: 7
-Losing Trades: 3
-Win Rate: 70.0%
-Average Profit/Loss per Trade: $250.00
-Average Profit/Loss % per Trade: 25.00%
-Total Dip Buys: 5
-Average Dip Buys per Trade: 0.5
-
-=== Time Period Analysis ===
-Earliest Buy Date: 2024-01-01
-Latest Sell Date: 2024-12-31
-Total Days: 365
-Total Months: 12.0
-Monthly Return: 2.08%
-Quarterly Return: 6.25%
-Annual Return: 25.00%
-``` 
