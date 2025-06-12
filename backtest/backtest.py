@@ -81,9 +81,9 @@ class StockAccount:
     def can_execute_buy(self, trade: Trade, price: float, hist_data: pd.DataFrame) -> bool:
         required_amount = trade.buy_amount
         
-        # Check if we've already made 3 buys for this position
-        if trade.buy_count >= 3:
-            logger.info(f"Skipping buy for {trade.ticker} - maximum buys (3) reached")
+        # Check if we've already made 4 buys for this position
+        if trade.buy_count >= 4:
+            logger.info(f"Skipping buy for {trade.ticker} - maximum buys (4) reached")
             return False
 
         # Check if we have enough cash
